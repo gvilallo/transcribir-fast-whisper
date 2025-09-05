@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VENV="$HOME/faster-whisper-env"
+PYTHON_BIN="$VENV/bin/python3"
+
+usage() {
+  cat <<EOF
+Uso:
+  transcribir-fast [opciones] <INPUT>
+INPUT:
+  - URL de YouTube (http/https)
+  - Archivo local (mp4, mp3, wav, mkv, etc.)
+Opciones:
+  -m, --model NOMBRE    Modelo Whisper: tiny|base|small|medium|large (por defecto: small)
+  -l, --lang  CODIGO    Idioma (por defecto: es)
+  -o, --outdir DIR      Carpeta base de salida (por defecto: ~/transcripciones)
+  -s, --start HH:MM:SS  Recorte: inicio (opcional)
+  -e, --end   HH:MM:SS  Recorte: fin (opcional)
+  -w, --words           Timestamps por palabra (más lento)
+  -d, --device DEVICE   Dispositivo: cpu|cuda|auto (por defecto: auto)
+  -h, --help            Ayuda
+Ejemplos:
+  transcribir-fast "https://www.youtube.com/watch?v=v1SrD2cqj6o"
+  transcribir-fast -m base -o ~/mis_transcripciones entrevista.mp4
+  transcribir-fast -s 00:00:30 -e 00:02:30 charla.mp3
+  transcribir-fast -d cuda video.mp4  # Para usar GPU
+EOF
+}
+
+# Función para mostrar progreso
+show_progress() {
+    local step=$1
+    local total=$2
+    local message=$3
+    local percentage=$((step * 100 / total))
+    local completed=$((step * 20 / total))
+    local remaining=$((20 - completed))
+    
+    printf "\r[%d/%d] %s " "$step" "$total" "$message"
+    printf "["
+    printf "%*s" $completed | tr ' ' '█'
+    printf "%*s" $remaining | tr ' ' '░'
+    printf "] %d%%" "$percentage"
+}
+
+# Función para limpiar nombre de archivo
+clean_filename() {
+    echo "$1" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | sed 's/^_\|_$//g' | cut -c1-50
+}
+
+# Función para obtener título de YouTube
+get_youtube_title() {
+    local url="$1"
+    local title
+    title=$(yt-dlp --get-title "$url" 2>/dev/null | head -n1 | cut -c1-50)
+    if [[ -n "$title" ]]; then
+        clean_filename "$title"
+    else
+        echo "youtube_video"
+    fi
+}
+
+# Defaults
+MODEL="small"
+LANG="es"
+BASE_OUTDIR="$HOME/transcripciones"
+START=""
+END=""
+WORD_TS="False"
+DEVICE="auto"
+ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--model) MODEL="$2"; shift 2 ;;
+    -l|--lang)  LANG="$2";  shift 2 ;;
+    -o|--outdir) BASE_OUTDIR="$2"; shift 2 ;;
+    -s|--start) START="$2"; shift 2 ;;
+    -e|--end)   END="$2";   shift 2 ;;
+    -w|--words) WORD_TS="True"; shift 1 ;;
+    -d|--device) DEVICE="$2"; shift 2 ;;
+    -h|--help)  usage; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "Opción desconocida: $1"; usage; exit 1 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#ARGS[@]} -lt 1 ]]; then usage; exit 1; fi
+INPUT="${ARGS[0]}"
+
+# Verificar dependencias
+echo "🔍 Verificando dependencias..."
+command -v ffmpeg >/dev/null || { echo "❌ ffmpeg no encontrado. Instalá con: sudo apt install -y ffmpeg"; exit 1; }
+command -v yt-dlp >/dev/null || { echo "❌ yt-dlp no encontrado. Instalá con el wget indicado en la guía."; exit 1; }
+
+# Asegurar Faster-Whisper en venv
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "📦 Instalando Faster-Whisper en $VENV ..."
+  python3 -m venv "$VENV"
+  source "$VENV/bin/activate"
+  pip install -U pip faster-whisper
+  deactivate
+fi
+
+# Crear directorio con timestamp y nombre
+TIMESTAMP=$(date '+%Y-%m-%d_%H-%M-%S')
+if [[ "$INPUT" =~ ^https?:// ]]; then
+    echo "🎬 Obteniendo título del video..."
+    VIDEO_NAME=$(get_youtube_title "$INPUT")
+    FOLDER_NAME="${TIMESTAMP}_${VIDEO_NAME}"
+else
+    FILE_NAME=$(basename "$INPUT" | sed 's/\.[^.]*$//')
+    CLEAN_NAME=$(clean_filename "$FILE_NAME")
+    FOLDER_NAME="${TIMESTAMP}_${CLEAN_NAME}"
+fi
+
+OUTDIR="$BASE_OUTDIR/$FOLDER_NAME"
+mkdir -p "$OUTDIR"
+
+echo "📁 Carpeta de trabajo: $OUTDIR"
+
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+AUDIO_IN="$TMPDIR/in.mp3"
+
+# Paso 1: Descargar/Convertir audio
+show_progress 1 4 "Procesando entrada..."
+echo ""
+
+if [[ "$INPUT" =~ ^https?:// ]]; then
+  echo "⬇️  Descargando audio desde YouTube..."
+  yt-dlp -x --audio-format mp3 --audio-quality 0 \
+    --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+    --extractor-retries 3 \
+    --fragment-retries 3 \
+    -o "$TMPDIR/in.%(ext)s" "$INPUT" || \
+  yt-dlp -f "bestaudio/best" \
+    --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+    -o "$TMPDIR/in.%(ext)s" "$INPUT"
+    
+  if [[ -f "$TMPDIR/in.mp3" ]]; then
+    AUDIO_IN="$TMPDIR/in.mp3"
+  else
+    AUDIO_IN="$(ls "$TMPDIR"/in.* | head -n1)"
+  fi
+  
+  # Copiar audio original a la carpeta de salida
+  cp "$AUDIO_IN" "$OUTDIR/audio_original.mp3"
+else
+  # Archivo local -> convertir a mp3 si hace falta
+  if [[ ! -f "$INPUT" ]]; then echo "❌ Archivo no encontrado: $INPUT"; exit 1; fi
+  ext="${INPUT##*.}"; shopt -s nocasematch
+  if [[ "$ext" == "mp3" ]]; then
+    cp "$INPUT" "$AUDIO_IN"
+  else
+    echo "🔄 Convirtiendo a MP3..."
+    ffmpeg -y -i "$INPUT" -vn -c:a libmp3lame -q:a 0 "$AUDIO_IN" </dev/null
+  fi
+  shopt -u nocasematch
+  
+  # Copiar archivo original
+  cp "$INPUT" "$OUTDIR/"
+fi
+
+# Paso 2: Recorte opcional
+AUDIO_TO_TRANSCRIBE="$AUDIO_IN"
+if [[ -n "$START" || -n "$END" ]]; then
+  show_progress 2 4 "Aplicando recorte $START - $END..."
+  echo ""
+  CUT="$TMPDIR/cut.mp3"
+  ffmpeg -y -i "$AUDIO_IN" ${START:+-ss "$START"} ${END:+-to "$END"} -c copy "$CUT" </dev/null
+  AUDIO_TO_TRANSCRIBE="$CUT"
+fi
+
+# Crear script Python mejorado para transcripción
+PYTHON_SCRIPT="$TMPDIR/transcribe.py"
+cat > "$PYTHON_SCRIPT" << 'EOF'
+import sys
+import os
+import json
+import time
+from faster_whisper import WhisperModel
+import argparse
+
+def show_progress_bar(current, total, prefix='', suffix='', length=30):
+    percent = current / total
+    filled_length = int(length * percent)
+    bar = '█' * filled_length + '░' * (length - filled_length)
+    print(f'\r{prefix} [{bar}] {percent:.1%} {suffix}', end='', flush=True)
+
+def transcribe_with_faster_whisper(audio_file, model_size, language, device, word_timestamps, output_dir):
+    print(f"🤖 Cargando modelo {model_size} en {device}...")
+    
+    # Configurar compute_type según el dispositivo
+    if device == "cuda":
+        compute_type = "float16"
+    else:
+        compute_type = "int8"
+    
+    try:
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    except Exception as e:
+        print(f"⚠️  Error cargando modelo en {device}, probando con CPU...")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    
+    print("🎵 Analizando audio...")
+    
+    # Obtener duración del audio para calcular progreso
+    import subprocess
+    try:
+        result = subprocess.run(['ffprobe', '-v', 'quiet', '-show_entries', 
+                               'format=duration', '-of', 'csv=p=0', audio_file], 
+                              capture_output=True, text=True)
+        duration = float(result.stdout.strip())
+    except:
+        duration = 0
+    
+    print(f"⏱️  Duración detectada: {duration:.1f} segundos")
+    print("🚀 Iniciando transcripción...")
+    
+    segments, info = model.transcribe(
+        audio_file, 
+        language=language,
+        word_timestamps=word_timestamps
+    )
+    
+    # Extraer nombre base del archivo
+    base_name = "transcripcion"
+    
+    # Generar diferentes formatos
+    transcript_text = ""
+    srt_content = ""
+    vtt_content = "WEBVTT\n\n"
+    json_data = {
+        "text": "",
+        "segments": [],
+        "language": info.language,
+        "language_probability": info.language_probability,
+        "duration": info.duration,
+        "model": model_size,
+        "word_timestamps": word_timestamps
+    }
+    
+    segments_list = list(segments)
+    total_segments = len(segments_list)
+    
+    print(f"\n📝 Procesando {total_segments} segmentos...")
+    
+    for i, segment in enumerate(segments_list):
+        # Mostrar progreso
+        if i % 5 == 0 or i == total_segments - 1:
+            show_progress_bar(i + 1, total_segments, 
+                            prefix='Transcribiendo:', 
+                            suffix=f'({i+1}/{total_segments})')
+        
+        start_time = segment.start
+        end_time = segment.end
+        text = segment.text.strip()
+        
+        # Texto plano
+        transcript_text += text + " "
+        
+        # SRT
+        start_srt = format_time_srt(start_time)
+        end_srt = format_time_srt(end_time)
+        srt_content += f"{i+1}\n{start_srt} --> {end_srt}\n{text}\n\n"
+        
+        # VTT
+        start_vtt = format_time_vtt(start_time)
+        end_vtt = format_time_vtt(end_time)
+        vtt_content += f"{start_vtt} --> {end_vtt}\n{text}\n\n"
+        
+        # JSON - Preparar datos del segmento
+        segment_data = {
+            "id": i,
+            "start": start_time,
+            "end": end_time,
+            "text": text,
+            "duration": end_time - start_time
+        }
+        
+        # Agregar palabras si están disponibles
+        if word_timestamps and hasattr(segment, 'words') and segment.words:
+            segment_data["words"] = []
+            for word in segment.words:
+                segment_data["words"].append({
+                    "word": word.word,
+                    "start": word.start,
+                    "end": word.end,
+                    "probability": word.probability
+                })
+        
+        json_data["segments"].append(segment_data)
+    
+    print()  # Nueva línea después de la barra de progreso
+    
+    # Completar texto en JSON
+    json_data["text"] = transcript_text.strip()
+    
+    print("💾 Guardando archivos...")
+    
+    # Guardar archivos
+    with open(os.path.join(output_dir, f"{base_name}.txt"), "w", encoding="utf-8") as f:
+        f.write(transcript_text.strip())
+    
+    with open(os.path.join(output_dir, f"{base_name}.srt"), "w", encoding="utf-8") as f:
+        f.write(srt_content)
+    
+    with open(os.path.join(output_dir, f"{base_name}.vtt"), "w", encoding="utf-8") as f:
+        f.write(vtt_content)
+    
+    with open(os.path.join(output_dir, f"{base_name}.json"), "w", encoding="utf-8") as f:
+        json.dump(json_data, f, ensure_ascii=False, indent=2)
+    
+    print(f"✅ Transcripción completada!")
+    print(f"🗣️  Idioma detectado: {info.language} (confianza: {info.language_probability:.1%})")
+    print(f"⏱️  Duración procesada: {info.duration:.1f} segundos")
+    print(f"📊 Total de segmentos: {total_segments}")
+
+def format_time_srt(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millisecs = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
+
+def format_time_vtt(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("audio_file")
+    parser.add_argument("--model", default="small")
+    parser.add_argument("--language", default="es")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--word_timestamps", action="store_true")
+    parser.add_argument("--output_dir", default=".")
+    
+    args = parser.parse_args()
+    
+    device = args.device
+    if device == "auto":
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            device = "cpu"
+    
+    transcribe_with_faster_whisper(
+        args.audio_file, 
+        args.model, 
+        args.language, 
+        device, 
+        args.word_timestamps, 
+        args.output_dir
+    )
+EOF
+
+# Paso 3: Transcripción
+show_progress 3 4 "Preparando transcripción..."
+echo ""
+
+PYTHON_ARGS=("$PYTHON_BIN" "$PYTHON_SCRIPT" "$AUDIO_TO_TRANSCRIBE" 
+             --model "$MODEL" 
+             --language "$LANG" 
+             --device "$DEVICE" 
+             --output_dir "$OUTDIR")
+
+if [[ "$WORD_TS" == "True" ]]; then 
+    PYTHON_ARGS+=(--word_timestamps)
+fi
+
+"${PYTHON_ARGS[@]}"
+
+# Paso 4: Generar archivo de información
+show_progress 4 4 "Generando metadatos..."
+echo ""
+
+INFO_FILE="$OUTDIR/info.txt"
+cat > "$INFO_FILE" << EOF
+INFORMACIÓN DE TRANSCRIPCIÓN
+==========================
+
+📅 Fecha: $(date '+%Y-%m-%d %H:%M:%S')
+🎯 Fuente: $INPUT
+🤖 Modelo: $MODEL
+🗣️  Idioma: $LANG
+💻 Dispositivo: $DEVICE
+⏱️  Timestamps por palabra: $WORD_TS
+📁 Carpeta: $FOLDER_NAME
+
+ARCHIVOS GENERADOS:
+📄 transcripcion.txt - Texto plano
+🎬 transcripcion.srt - Subtítulos estándar
+🌐 transcripcion.vtt - Subtítulos web
+📊 transcripcion.json - Datos estructurados con timestamps
+🎵 audio_original.mp3 - Audio procesado
+📋 info.txt - Este archivo de metadatos
+
+EOF
+
+if [[ -n "$START" || -n "$END" ]]; then
+    echo "✂️  Recorte aplicado: ${START:-00:00:00} - ${END:-fin}" >> "$INFO_FILE"
+fi
+
+echo "" >> "$INFO_FILE"
+echo "TAMAÑOS DE ARCHIVO:" >> "$INFO_FILE"
+ls -lah "$OUTDIR"/*.txt "$OUTDIR"/*.srt "$OUTDIR"/*.vtt "$OUTDIR"/*.json 2>/dev/null | awk '{print $9 ": " $5}' >> "$INFO_FILE"
+
+echo ""
+echo "🎉 ¡TRANSCRIPCIÓN COMPLETADA!"
+echo "📁 Todos los archivos están en: $OUTDIR"
+echo "📋 Ver metadatos: cat '$INFO_FILE'"
+echo ""
+echo "📊 Velocidad mejorada con Faster-Whisper (4-10x más rápido)"
+echo "🚀 Organización automática por fecha y nombre"
